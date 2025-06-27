@@ -199,6 +199,36 @@ exports.revisionHistorySync = async (req, res, next) => {
   }
 };
 
+exports.getRevisionHistoryByRecordId = async (req, res, next) => {
+  try {
+    const { recordId } = req.params;
+    
+    if (!recordId) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Record ID is required'
+      });
+    }
+    
+    const revisionHistory = await ParsedRevisionHistoryModel.findOne({ recordId }).lean();
+    
+    if (!revisionHistory) {
+      return res.status(404).json({
+        status: 'fail',
+        message: 'Revision history not found for this record'
+      });
+    }
+    
+    res.status(200).json({
+      status: 'success',
+      data: revisionHistory
+    });
+  } catch (error) {
+    console.error('Error fetching revision history:', error);
+    next(error);
+  }
+};
+
 function extractFieldsFromData(documents) {
   const fieldMap = new Map();
   const excludeFields = ['_id', '__v', 'createdAt', 'updatedAt'];

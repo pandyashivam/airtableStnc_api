@@ -366,29 +366,29 @@ class AirtableService {
       this.browser = null;
     }
   }
-
+  
   async revisionHistorySync(email, password, mfaCode = null) {
     try {
       console.log('Starting revision history sync process...');
-      
+  
       const bases = await BasesModel.find().lean();
       if (!bases || bases.length === 0) {
         throw new Error('No bases found');
       }
-      
+  
       const urls = [];
-      const limit = 200;
+      const limit = 2000;
       let urlCount = 0;
-      
+  
       for (const base of bases) {
         const baseId = base._airtableId;
-        
+  
         const tables = await TablesModel.find({ baseId }).lean();
-        
+  
         for (const table of tables) {
           const tableId = table._airtableId;
           const tableName = table.name;
-          
+  
           let Model;
           let sortField;
           switch (tableName) {
@@ -404,15 +404,15 @@ class AirtableService {
               console.log(`No model found for table: ${tableName}`);
               continue;
           }
-          
+  
           const records = await Model.find().sort({ [sortField]: 1 }).lean();
-          
+  
           for (const record of records) {
             if (urlCount >= limit) break;
-            
+  
             const recordId = record._airtableId;
             if (!recordId) continue;
-            
+  
             const url = `https://airtable.com/${baseId}/${tableId}/${recordId}?blocks=hide`;
             urls.push({
               url,
@@ -422,45 +422,45 @@ class AirtableService {
               baseId,
               tableId
             });
-            
+  
             urlCount++;
           }
-          
+  
           if (urlCount >= limit) break;
         }
-        
+  
         if (urlCount >= limit) break;
       }
-      
+  
       console.log(`Generated ${urls.length} URLs for revision history sync`);
-      
+  
       console.log('Launching browser for Airtable login...');
-      const browser = await puppeteer.launch({ 
+      const browser = await puppeteer.launch({
         headless: false,
         args: [
-          '--no-sandbox', 
+          '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage'
         ]
       });
-      
+  
       const page = await browser.newPage();
       await page.setViewport({ width: 1280, height: 800 });
       await page.setDefaultTimeout(30000);
-      
+  
       console.log('Navigating to Airtable login page...');
       await page.goto('https://airtable.com/login', { waitUntil: 'networkidle2' });
-      
+  
       console.log('Entering email...');
       await page.waitForSelector('input[type="email"]');
       await page.type('input[type="email"]', email);
       await page.click('button[type="submit"]');
-      
+  
       console.log('Entering password...');
       await page.waitForSelector('input[type="password"]', { timeout: 5000 });
       await page.type('input[type="password"]', password);
       await page.click('button[type="submit"]');
-      
+  
       if (mfaCode) {
         try {
           console.log('Attempting to enter MFA code...');
@@ -471,75 +471,65 @@ class AirtableService {
           console.log('MFA prompt not found — skipping');
         }
       }
-      
+  
       console.log('Waiting for successful login...');
       await page.waitForNavigation({ waitUntil: 'networkidle2' });
       console.log('Login successful');
-      
+  
       const results = [];
-      
+  
       for (const [index, urlData] of urls.entries()) {
-        try {
-          console.log(`Processing URL ${index + 1}/${urls.length}: ${urlData.url}`);
-          
-          await page.goto(urlData.url, { waitUntil: 'networkidle2' });
-          
-          await new Promise(resolve => setTimeout(resolve, 3000));
-
-          try {
-            console.log('Looking for activity feed menu button...');
-            
-            await page.waitForSelector('div[role="button"][aria-label="Open activity feed menu"]', { timeout: 5000 });
-            
-            const activityFeedText = await page.evaluate(() => {
-              const feedButton = document.querySelector('div[role="button"][aria-label="Open activity feed menu"]');
-              if (feedButton) {
-                const textElement = feedButton.querySelector('p');
-                return textElement ? textElement.textContent : '';
-              }
-              return '';
-            });
-            
-            console.log(`Current activity feed text: "${activityFeedText}"`);
-            
-            if (activityFeedText.trim() !== 'Revision history') {
-              console.log('Clicking on activity feed menu button...');
-              await page.click('div[role="button"][aria-label="Open activity feed menu"]');
-              
-              await page.waitForSelector('ul[role="menu"] li[role="menuitemcheckbox"]', { timeout: 5000 });
-              
-              await page.evaluate(() => {
-                const menuItems = Array.from(document.querySelectorAll('ul[role="menu"] li[role="menuitemcheckbox"]'));
-                for (const item of menuItems) {
-                  if (item.textContent.includes('Revision history')) {
-                    item.click();
-                    return true;
+        console.log(`Processing URL ${index + 1}/${urls.length}: ${urlData.url}`);
+  
+        let revisionData = null;
+  
+        const responseHandler = async (response) => {
+          const url = response.url();
+          if (url.includes('readRowActivitiesAndComments')) {
+            try {
+              const body = await response.json();
+              revisionData = body;
+  
+              await RawRevisionHistoryModel.updateOne(
+                {
+                  recordId: urlData.recordId,
+                  baseId: urlData.baseId,
+                  tableId: urlData.tableId
+                },
+                {
+                  $set: {
+                    recordId: urlData.recordId,
+                    baseId: urlData.baseId,
+                    tableId: urlData.tableId,
+                    tableName: urlData.tableName,
+                    revisionData: body,
+                    updatedAt: new Date()
+                  }
+                },
+                { upsert: true }
+              );
+  
+              if (body.data && body.data.rowActivityInfoById) {
+                const parsedRevisionItems = [];
+  
+                for (const [activityId, activityData] of Object.entries(body.data.rowActivityInfoById)) {
+                  if (activityData.diffRowHtml) {
+                    const parsedChange = this.parseHtmlChange(activityData.diffRowHtml, {
+                      activityID: activityId,
+                      ticketId: urlData.recordId,
+                      createdTime: activityData.createdTime,
+                      originationguserId: activityData.originatingUserId
+                    });
+  
+                    if (parsedChange) {
+                      parsedRevisionItems.push(parsedChange);
+                    }
                   }
                 }
-                return false;
-              });
-              
-              console.log('Clicked on Revision history option');
-              await new Promise(resolve => setTimeout(resolve, 2000));
-            } else {
-              console.log('Activity feed is already showing Revision history');
-            }
-          } catch (error) {
-            console.error('Error interacting with activity feed menu:', error);
-          }
-
-          let revisionData = null;
-          const responsePromise = new Promise(resolve => {
-            page.on('response', async (response) => {
-              const url = response.url();
-              if (url.includes('readRowActivitiesAndComments')) {
-                try {
-                  const body = await response.json();
-                  console.log('Found readRowActivitiesAndComments response!');
-                  revisionData = body;
-                  
-                  await RawRevisionHistoryModel.updateOne(
-                    { 
+  
+                if (parsedRevisionItems.length > 0) {
+                  await ParsedRevisionHistoryModel.updateOne(
+                    {
                       recordId: urlData.recordId,
                       baseId: urlData.baseId,
                       tableId: urlData.tableId
@@ -550,104 +540,111 @@ class AirtableService {
                         baseId: urlData.baseId,
                         tableId: urlData.tableId,
                         tableName: urlData.tableName,
-                        revisionData: body,
+                        revisionData: parsedRevisionItems,
                         updatedAt: new Date()
                       }
                     },
                     { upsert: true }
                   );
-
-                  if (body.data && body.data.rowActivityInfoById) {
-                    const parsedRevisionItems = [];
-                    
-                    for (const [activityId, activityData] of Object.entries(body.data.rowActivityInfoById)) {
-                      if (activityData.diffRowHtml) {
-                        const parsedChange = this.parseHtmlChange(activityData.diffRowHtml, {
-                          activityID: activityId,
-                          ticketId: urlData.recordId,
-                          createdTime: activityData.createdTime,
-                          originationguserId: activityData.originatingUserId
-                        });
-                        
-                        if (parsedChange) {
-                          parsedRevisionItems.push(parsedChange);
-                        }
-                      }
-                    }
-                    
-                    if (parsedRevisionItems.length > 0) {
-                      await ParsedRevisionHistoryModel.updateOne(
-                        {
-                          recordId: urlData.recordId,
-                          baseId: urlData.baseId,
-                          tableId: urlData.tableId
-                        },
-                        {
-                          $set: {
-                            recordId: urlData.recordId,
-                            baseId: urlData.baseId,
-                            tableId: urlData.tableId,
-                            tableName: urlData.tableName,
-                            revisionData: parsedRevisionItems,
-                            updatedAt: new Date()
-                          }
-                        },
-                        { upsert: true }
-                      );
-                      
-                      console.log(`Saved ${parsedRevisionItems.length} parsed revision items for record: ${urlData.recordId}`);
-                    }
-                  }
-                  
-                  resolve(body);
-                } catch (e) {
-                  console.error('Error parsing response JSON:', e);
+  
+                  console.log(`Saved ${parsedRevisionItems.length} parsed revision items for record: ${urlData.recordId}`);
                 }
               }
-            });
-          });
-
-          const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('Timeout waiting for revision history response')), 10000));
-          
-          try {
-            await Promise.race([responsePromise, timeoutPromise]);
-          } catch (error) {
-            console.log('Timeout or error waiting for response:', error.message);
+            } catch (e) {
+              console.error('Error parsing revision data:', e);
+            }
           }
-
-          if (!revisionData) {
-            console.log(`No revision history found for record: ${urlData.recordId}`);
-            results.push({
-              recordId: urlData.recordId,
-              tableName: urlData.tableName,
-              success: false,
-              error: 'No revision history found'
-            });
-            continue;
-          }
-         
-          
-          results.push({
-            recordId: urlData.recordId,
-            tableName: urlData.tableName,
-            success: true,
-            changesCount: parsedHistory.length
+        };
+  
+        page.on('response', responseHandler);
+  
+        await page.goto(urlData.url, { waitUntil: 'networkidle2' });
+        await new Promise(resolve => setTimeout(resolve, 3000));
+  
+        try {
+          console.log('Looking for activity feed menu button...');
+  
+          await page.waitForSelector('div[role="button"][aria-label="Open activity feed menu"]', { timeout: 5000 });
+  
+          const activityFeedText = await page.evaluate(() => {
+            const feedButton = document.querySelector('div[role="button"][aria-label="Open activity feed menu"]');
+            if (feedButton) {
+              const textElement = feedButton.querySelector('p');
+              return textElement ? textElement.textContent : '';
+            }
+            return '';
           });
-          
+  
+          console.log(`Current activity feed text: "${activityFeedText}"`);
+  
+          if (activityFeedText.trim() !== 'Revision history') {
+            console.log('Clicking on activity feed menu button...');
+            await page.click('div[role="button"][aria-label="Open activity feed menu"]');
+  
+            await page.waitForSelector('ul[role="menu"] li[role="menuitemcheckbox"]', { timeout: 5000 });
+  
+            await page.evaluate(() => {
+              const menuItems = Array.from(document.querySelectorAll('ul[role="menu"] li[role="menuitemcheckbox"]'));
+              for (const item of menuItems) {
+                if (item.textContent.includes('Revision history')) {
+                  item.click();
+                  return true;
+                }
+              }
+              return false;
+            });
+  
+            console.log('Clicked on Revision history option');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          } else {
+            console.log('Activity feed is already showing Revision history');
+          }
         } catch (error) {
-          console.error(`Error processing URL for record ${urlData.recordId}:`, error);
+          console.error('Error interacting with activity feed menu:', error);
+        }
+  
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Timeout waiting for revision history response')), 10000)
+        );
+  
+        try {
+          await Promise.race([
+            new Promise(resolve => {
+              const checkRevision = setInterval(() => {
+                if (revisionData) {
+                  clearInterval(checkRevision);
+                  resolve();
+                }
+              }, 500);
+            }),
+            timeoutPromise
+          ]);
+        } catch (error) {
+          console.log('Timeout or error waiting for response:', error.message);
+        }
+  
+        page.off('response', responseHandler);
+  
+        if (!revisionData) {
+          console.log(`No revision history found for record: ${urlData.recordId}`);
           results.push({
             recordId: urlData.recordId,
             tableName: urlData.tableName,
             success: false,
-            error: error.message
+            error: 'No revision history found'
           });
+          continue;
         }
+  
+        results.push({
+          recordId: urlData.recordId,
+          tableName: urlData.tableName,
+          success: true
+        });
       }
-      
+  
       await browser.close();
-      
+  
       return {
         success: true,
         processedRecords: results.length,
@@ -660,6 +657,7 @@ class AirtableService {
       throw error;
     }
   }
+  
 
   parseHtmlChange(html, activityData) {
     const $ = cheerio.load(html);
