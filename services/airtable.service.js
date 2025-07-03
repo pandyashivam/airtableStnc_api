@@ -377,7 +377,7 @@ class AirtableService {
       }
   
       const urls = [];
-      const limit = 2000;
+      const limit = 20000;
       let urlCount = 0;
   
       for (const base of bases) {
@@ -413,9 +413,7 @@ class AirtableService {
             const recordId = record._airtableId;
             if (!recordId) continue;
   
-            const url = `https://airtable.com/${baseId}/${tableId}/${recordId}?blocks=hide`;
             urls.push({
-              url,
               recordId,
               tableName,
               modelId: record._id,
@@ -434,6 +432,7 @@ class AirtableService {
   
       console.log(`Generated ${urls.length} URLs for revision history sync`);
   
+      // Launch browser for login only
       console.log('Launching browser for Airtable login...');
       const browser = await puppeteer.launch({
         headless: false,
@@ -441,7 +440,8 @@ class AirtableService {
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage'
-        ]
+        ],
+        defaultViewport: null
       });
   
       const page = await browser.newPage();
@@ -476,21 +476,185 @@ class AirtableService {
       await page.waitForNavigation({ waitUntil: 'networkidle2' });
       console.log('Login successful');
   
+      // Extract cookies after successful login
+      const cookies = await page.cookies();
+      console.log(`Found ${cookies.length} cookies after login`);
+      
+      // Log all cookie names to help with debugging
+      console.log('Cookie names:', cookies.map(c => c.name).join(', '));
+      
+      // Get all request headers from a real browser session
+      const headers = await page.evaluate(() => {
+        const result = {};
+        const req = new XMLHttpRequest();
+        req.open('GET', document.location.href, false);
+        req.send(null);
+        const headerString = req.getAllResponseHeaders();
+        const headerPairs = headerString.split('\r\n');
+        for (let i = 0; i < headerPairs.length; i++) {
+          const pair = headerPairs[i].split(': ');
+          if (pair[0]) {
+            result[pair[0]] = pair[1];
+          }
+        }
+        return result;
+      });
+      
+      console.log('Headers from browser session:', JSON.stringify(headers));
+      
+      const cookieString = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+      console.log('Extracted cookies from browser session');
+      
+      // Close browser as we don't need it anymore
+      await browser.close();
+      
       const results = [];
+      let cookiesValid = true;
+      
+      // Function to check if cookies are valid and refresh them if needed
+      const ensureValidCookies = async () => {
+        if (!cookiesValid) {
+          console.log('Cookies expired, re-logging in...');
+          // Re-login and get fresh cookies
+          const browser = await puppeteer.launch({
+            headless: false,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+          });
+          
+          const page = await browser.newPage();
+          await page.setViewport({ width: 1280, height: 800 });
+          await page.setDefaultTimeout(30000);
+          
+          await page.goto('https://airtable.com/login', { waitUntil: 'networkidle2' });
+          await page.waitForSelector('input[type="email"]');
+          await page.type('input[type="email"]', email);
+          await page.click('button[type="submit"]');
+          
+          await page.waitForSelector('input[type="password"]', { timeout: 5000 });
+          await page.type('input[type="password"]', password);
+          await page.click('button[type="submit"]');
+          
+          if (mfaCode) {
+            try {
+              await page.waitForSelector('input[name="otp"]', { timeout: 3000 });
+              await page.type('input[name="otp"]', mfaCode);
+              await page.click('button[type="submit"]');
+            } catch (e) {
+              console.log('MFA prompt not found — skipping');
+            }
+          }
+          
+          await page.waitForNavigation({ waitUntil: 'networkidle2' });
+          
+                     const freshCookies = await page.cookies();
+           const newCookieString = freshCookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+           cookieString = newCookieString;
+           console.log('Refreshed cookies from browser session');
+          
+          await browser.close();
+          cookiesValid = true;
+        }
+      };
   
       for (const [index, urlData] of urls.entries()) {
-        console.log(`Processing URL ${index + 1}/${urls.length}: ${urlData.url}`);
+        await ensureValidCookies();
+        
+        console.log(`Processing record ${index + 1}/${urls.length}: ${urlData.recordId}`);
   
-        let revisionData = null;
+        try {
+          // Construct the API endpoint URL - exactly matching the Airtable frontend request
+          const apiUrl = `https://airtable.com/v0.3/row/${urlData.recordId}/readRowActivitiesAndComments`;
+          
+          // Use fixed values for requestId and secretSocketId to match exactly what Airtable frontend sends
+          const params = {
+            stringifiedObjectParams: JSON.stringify({
+              limit: 10,
+              offsetV2: null,
+              shouldReturnDeserializedActivityItems: true,
+              shouldIncludeRowActivityOrCommentUserObjById: true
+            }),
+            requestId: 'reqvpDYcHmA6QI6YP',
+            secretSocketId: 'socgIkar6j282ik8e'
+          };
+          
+          const queryString = querystring.stringify(params);
+          const fullUrl = `${apiUrl}?${queryString}`;
+          
+          // Log the URL and cookies before making the request
+          console.log(`Making request to: ${fullUrl}`);
+          console.log(`Using cookies: ${cookieString.substring(0, 50)}...`);
+          
+          // Make the API request using axios with cookies - exactly matching Airtable's frontend headers
+          const pageLoadId = `pgl${Math.random().toString(36).substring(2, 15)}`;
+          const traceId = Math.random().toString(16).substring(2, 34);
+          const spanId = Math.random().toString(16).substring(2, 18);
+          
+          const response = await axios.get(fullUrl, {
+            headers: {
+              'Cookie': cookieString,
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+              'Accept': 'application/json, text/javascript, */*; q=0.01',
+              'Referer': `https://airtable.com/${urlData.baseId}/${urlData.tableId}/viwY85shOwug5YT4C/${urlData.recordId}?blocks=hide`,
+              'X-Requested-With': 'XMLHttpRequest',
+              'x-airtable-application-id': urlData.baseId,
+              'x-airtable-page-load-id': pageLoadId,
+              'x-airtable-inter-service-client': 'webClient',
+              'x-airtable-inter-service-client-code-version': '2b0c6c84990d91f0ce4fb60da616221a79defaec',
+              'x-airtable-client-queue-time': '5518.699999999255',
+              'x-time-zone': 'Asia/Calcutta',
+              'x-user-locale': 'en',
+              'sec-ch-ua': '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+              'sec-ch-ua-mobile': '?0',
+              'sec-ch-ua-platform': '"Windows"',
+              'traceparent': `00-${traceId}-${spanId}-01`,
+              'tracestate': ''
+            },
+            withCredentials: true
+          });
+          
+          const revisionData = response.data;
+          
+          // Save raw revision data
+          await RawRevisionHistoryModel.updateOne(
+            {
+              recordId: urlData.recordId,
+              baseId: urlData.baseId,
+              tableId: urlData.tableId
+            },
+            {
+              $set: {
+                recordId: urlData.recordId,
+                baseId: urlData.baseId,
+                tableId: urlData.tableId,
+                tableName: urlData.tableName,
+                revisionData: revisionData,
+                updatedAt: new Date()
+              }
+            },
+            { upsert: true }
+          );
   
-        const responseHandler = async (response) => {
-          const url = response.url();
-          if (url.includes('readRowActivitiesAndComments')) {
-            try {
-              const body = await response.json();
-              revisionData = body;
+          // Parse and save revision items
+          if (revisionData.data && revisionData.data.rowActivityInfoById) {
+            const parsedRevisionItems = [];
   
-              await RawRevisionHistoryModel.updateOne(
+            for (const [activityId, activityData] of Object.entries(revisionData.data.rowActivityInfoById)) {
+              if (activityData.diffRowHtml) {
+                const parsedChange = this.parseHtmlChange(activityData.diffRowHtml, {
+                  activityID: activityId,
+                  ticketId: urlData.recordId,
+                  createdTime: activityData.createdTime,
+                  originationguserId: activityData.originatingUserId
+                });
+  
+                if (parsedChange) {
+                  parsedRevisionItems.push(parsedChange);
+                }
+              }
+            }
+  
+            if (parsedRevisionItems.length > 0) {
+              await ParsedRevisionHistoryModel.updateOne(
                 {
                   recordId: urlData.recordId,
                   baseId: urlData.baseId,
@@ -502,148 +666,59 @@ class AirtableService {
                     baseId: urlData.baseId,
                     tableId: urlData.tableId,
                     tableName: urlData.tableName,
-                    revisionData: body,
+                    revisionData: parsedRevisionItems,
                     updatedAt: new Date()
                   }
                 },
                 { upsert: true }
               );
   
-              if (body.data && body.data.rowActivityInfoById) {
-                const parsedRevisionItems = [];
-  
-                for (const [activityId, activityData] of Object.entries(body.data.rowActivityInfoById)) {
-                  if (activityData.diffRowHtml) {
-                    const parsedChange = this.parseHtmlChange(activityData.diffRowHtml, {
-                      activityID: activityId,
-                      ticketId: urlData.recordId,
-                      createdTime: activityData.createdTime,
-                      originationguserId: activityData.originatingUserId
-                    });
-  
-                    if (parsedChange) {
-                      parsedRevisionItems.push(parsedChange);
-                    }
-                  }
-                }
-  
-                if (parsedRevisionItems.length > 0) {
-                  await ParsedRevisionHistoryModel.updateOne(
-                    {
-                      recordId: urlData.recordId,
-                      baseId: urlData.baseId,
-                      tableId: urlData.tableId
-                    },
-                    {
-                      $set: {
-                        recordId: urlData.recordId,
-                        baseId: urlData.baseId,
-                        tableId: urlData.tableId,
-                        tableName: urlData.tableName,
-                        revisionData: parsedRevisionItems,
-                        updatedAt: new Date()
-                      }
-                    },
-                    { upsert: true }
-                  );
-  
-                  console.log(`Saved ${parsedRevisionItems.length} parsed revision items for record: ${urlData.recordId}`);
-                }
-              }
-            } catch (e) {
-              console.error('Error parsing revision data:', e);
+              console.log(`Saved ${parsedRevisionItems.length} parsed revision items for record: ${urlData.recordId}`);
             }
           }
-        };
-  
-        page.on('response', responseHandler);
-  
-        await page.goto(urlData.url, { waitUntil: 'networkidle2' });
-        await new Promise(resolve => setTimeout(resolve, 3000));
-  
-        try {
-          console.log('Looking for activity feed menu button...');
-  
-          await page.waitForSelector('div[role="button"][aria-label="Open activity feed menu"]', { timeout: 5000 });
-  
-          const activityFeedText = await page.evaluate(() => {
-            const feedButton = document.querySelector('div[role="button"][aria-label="Open activity feed menu"]');
-            if (feedButton) {
-              const textElement = feedButton.querySelector('p');
-              return textElement ? textElement.textContent : '';
-            }
-            return '';
-          });
-  
-          console.log(`Current activity feed text: "${activityFeedText}"`);
-  
-          if (activityFeedText.trim() !== 'Revision history') {
-            console.log('Clicking on activity feed menu button...');
-            await page.click('div[role="button"][aria-label="Open activity feed menu"]');
-  
-            await page.waitForSelector('ul[role="menu"] li[role="menuitemcheckbox"]', { timeout: 5000 });
-  
-            await page.evaluate(() => {
-              const menuItems = Array.from(document.querySelectorAll('ul[role="menu"] li[role="menuitemcheckbox"]'));
-              for (const item of menuItems) {
-                if (item.textContent.includes('Revision history')) {
-                  item.click();
-                  return true;
-                }
-              }
-              return false;
-            });
-  
-            console.log('Clicked on Revision history option');
-            await new Promise(resolve => setTimeout(resolve, 2000));
-          } else {
-            console.log('Activity feed is already showing Revision history');
-          }
-        } catch (error) {
-          console.error('Error interacting with activity feed menu:', error);
-        }
-  
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Timeout waiting for revision history response')), 10000)
-        );
-  
-        try {
-          await Promise.race([
-            new Promise(resolve => {
-              const checkRevision = setInterval(() => {
-                if (revisionData) {
-                  clearInterval(checkRevision);
-                  resolve();
-                }
-              }, 500);
-            }),
-            timeoutPromise
-          ]);
-        } catch (error) {
-          console.log('Timeout or error waiting for response:', error.message);
-        }
-  
-        page.off('response', responseHandler);
-  
-        if (!revisionData) {
-          console.log(`No revision history found for record: ${urlData.recordId}`);
+          
           results.push({
             recordId: urlData.recordId,
             tableName: urlData.tableName,
-            success: false,
-            error: 'No revision history found'
+            success: true
           });
-          continue;
+        } catch (error) {
+          console.error(`Error fetching revision data for record ${urlData.recordId}:`, error.message);
+          
+          // Log detailed error information
+          if (error.response) {
+            console.error('Error response status:', error.response.status);
+            console.error('Error response headers:', JSON.stringify(error.response.headers));
+            console.error('Error response data:', JSON.stringify(error.response.data));
+            console.error('Request URL:', fullUrl);
+            console.error('Request headers:', JSON.stringify(error.config.headers));
+          }
+          
+          // Check if the error is due to invalid cookies
+          if (error.response && (error.response.status === 401 || error.response.status === 403)) {
+            console.log('Cookies appear to be expired or invalid, will refresh on next iteration');
+            cookiesValid = false;
+            
+            // Add to results as failed
+            results.push({
+              recordId: urlData.recordId,
+              tableName: urlData.tableName,
+              success: false,
+              error: 'Authentication error - cookies expired'
+            });
+          } else {
+            results.push({
+              recordId: urlData.recordId,
+              tableName: urlData.tableName,
+              success: false,
+              error: error.message
+            });
+          }
         }
-  
-        results.push({
-          recordId: urlData.recordId,
-          tableName: urlData.tableName,
-          success: true
-        });
+        
+        // Add a small delay between requests to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
-  
-      await browser.close();
   
       return {
         success: true,
